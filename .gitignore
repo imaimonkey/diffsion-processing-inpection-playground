@@ -1,0 +1,59 @@
+# ===============================
+# Python bytecode / caches
+# ===============================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+
+# ===============================
+# Virtual environments
+# ===============================
+.venv/
+venv/
+ENV/
+.env
+
+# ===============================
+# Jupyter
+# ===============================
+.ipynb_checkpoints/
+
+# ===============================
+# Slurm logs
+# - keep folder, ignore files inside
+# ===============================
+slurm_logs/*
+!slurm_logs/.gitkeep
+
+# ===============================
+# OS / Editor
+# ===============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ===============================
+# Build / packaging artifacts
+# ===============================
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# ===============================
+# Coverage
+# ===============================
+.coverage
+.coverage.*
+htmlcov/
+
+# ===============================
+# Project-specific (photo list)
+# ===============================
+python-version
