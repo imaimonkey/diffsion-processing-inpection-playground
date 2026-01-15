@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=dif-prcs-ins
 #SBATCH --nodelist=server2
-#SBATCH --output=slurm_logs/exp1%j.out
+#SBATCH --output=slurm_logs/exp2%j.out
 #SBATCH --error=slurm_logs/exp2%j.err
-#SBATCH --gres=gpu:2
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=99:00:00
