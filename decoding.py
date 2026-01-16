@@ -726,6 +726,15 @@ def generate_with_temporal_decay(
     total_steps = steps * num_blocks
     current_step = 0
 
+    # Logging Init
+    # Track x0 prediction history for Stability Score [Steps, Gen_Length]
+    x0_history = []
+    
+    # Token Log: Key=Index, Val={fix_step, fix_token, fix_conf, remask_events: [(step, prev_token, new_conf)]}
+    # Initialize for the full sequence length (Prompt + Gen)
+    L_total = prompt.shape[1] + gen_length
+    token_logs = {i: {'fix_step': -1, 'fix_token': -1, 'fix_conf': 0.0, 'remask_events': []} for i in range(L_total)}
+
     for num_block in range(num_blocks):
         block_start = prompt.shape[1] + num_block * block_length
         block_end = prompt.shape[1] + (num_block + 1) * block_length
@@ -738,7 +747,7 @@ def generate_with_temporal_decay(
             current_step += 1
             mask_index = (x == mask_id)
             
-            # --- Prdict ---
+            # --- Predict ---
             if cfg_scale > 0.:
                 un_x = x.clone()
                 un_x[prompt_index] = mask_id
@@ -756,6 +765,9 @@ def generate_with_temporal_decay(
             logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
             x0 = torch.argmax(logits_with_noise, dim=-1)
 
+            # Capture x0 for stability analysis (batch 0 only for simplicity as metrics assume list/single)
+            x0_history.append(x0[0].cpu().clone())
+
             p = F.softmax(logits.to(torch.float64), dim=-1)
             x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
             
@@ -767,6 +779,7 @@ def generate_with_temporal_decay(
             confidence = torch.where(mask_index, x0_p, -np.inf)
             
             transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            # Batched transfer
             for j in range(confidence.shape[0]):
                 k = num_transfer_tokens[j, i]
                 _, select_index = torch.topk(confidence[j], k=k)
@@ -775,6 +788,14 @@ def generate_with_temporal_decay(
             x[transfer_index] = x0[transfer_index]
             fix_time[transfer_index] = current_step
             
+            # Log Fixes (for batch 0)
+            if transfer_index[0].any():
+                fixed_indices = torch.nonzero(transfer_index[0], as_tuple=True)[0]
+                for idx in fixed_indices.cpu().numpy():
+                    token_logs[idx]['fix_step'] = current_step
+                    token_logs[idx]['fix_token'] = x0[0, idx].item()
+                    token_logs[idx]['fix_conf'] = x0_p[0, idx].item()
+
             # --- Remasking (Backward Correction) ---
             if remask_budget > 0.0:
                 # 1. Identify Candidates: Generated tokens (not prompt, not mask)
@@ -805,8 +826,17 @@ def generate_with_temporal_decay(
                             _, bottom_indices = torch.topk(candidate_scores[b], k=valid_k, largest=False)
                             remask_mask[b, bottom_indices] = True
                     
+                    # Log Remasks before applying (batch 0)
+                    if remask_mask[0].any():
+                        remasked_indices = torch.nonzero(remask_mask[0], as_tuple=True)[0]
+                        for idx in remasked_indices.cpu().numpy():
+                            # Log: (step, prev_token, new_conf_at_remask_time)
+                            # Actually we track remask events. 
+                            # The metric typically looks at: was it remasked? Did it change?
+                            token_logs[idx]['remask_events'].append((current_step, x[0, idx].item(), stability_score[0, idx].item()))
+
                     # Apply Remask
                     x[remask_mask] = mask_id
                     fix_time[remask_mask] = -1
 
-    return x, total_steps
+    return x, {'x0_history': x0_history, 'token_logs': token_logs, 'total_steps': total_steps}
