@@ -998,3 +998,385 @@ def inspect_sampling(
             x[transfer_mask] = x0[transfer_mask]
 
     return x, detailed_history
+
+
+# ============================================================================
+# Graph-Aware Historical Remasking Decoder - New Implementation
+# ============================================================================
+
+def calculate_uncertainty(logits, x0, method='neg_log_prob'):
+    """
+    토큰 예측의 불확실성을 계산합니다.
+    
+    Args:
+        logits: 모델 로짓 [B, L, V]
+        x0: 예측된 토큰 [B, L]
+        method: 'neg_log_prob', 'entropy', 'margin' 중 선택
+        
+    Returns:
+        uncertainty: [B, L] 불확실성 점수 (높을수록 불확실)
+    """
+    p = F.softmax(logits.to(torch.float64), dim=-1)
+    
+    if method == 'neg_log_prob':
+        # -log(p(x0)): 선택된 토큰의 음의 로그 확률
+        x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+        uncertainty = -torch.log(x0_p + 1e-12)
+    elif method == 'entropy':
+        # H(p) = -Σ p*log(p)
+        uncertainty = -torch.sum(p * torch.log(p + 1e-12), dim=-1)
+    elif method == 'margin':
+        # 1 - (p1 - p2): top-2 확률 차이의 역수
+        sorted_probs, _ = torch.sort(p, dim=-1, descending=True)
+        margin = sorted_probs[:, :, 0] - sorted_probs[:, :, 1]
+        uncertainty = 1.0 - margin
+    else:
+        raise ValueError(f"Unknown uncertainty method: {method}")
+    
+    return uncertainty
+
+
+def extract_attention_influence(model, x, attention_mask=None, layer_indices=None, top_k=10):
+    """
+    모델 forward pass에서 attention 기반 영향력을 추출합니다.
+    
+    Args:
+        model: LLaDA 모델
+        x: 입력 토큰 시퀀스 [B, L]
+        attention_mask: Optional attention mask
+        layer_indices: 사용할 레이어 인덱스 (None = 마지막 레이어만)
+        top_k: 각 위치당 유지할 top-k attention weights
+        
+    Returns:
+        influence_matrix: [B, L, L] sparse influence scores (j -> i)
+                         influence_matrix[b, j, i] = token j가 token i에게 미친 영향
+    """
+    device = x.device
+    B, L = x.shape
+    
+    # Attention weights를 저장할 텐서 초기화
+    influence_matrix = torch.zeros(B, L, L, device=device, dtype=torch.float32)
+    
+    try:
+        # 모델이 attention weights를 반환하도록 시도
+        outputs = model(x, attention_mask=attention_mask, output_attentions=True)
+        
+        if hasattr(outputs, 'attentions') and outputs.attentions is not None:
+            # attentions: tuple of [B, num_heads, L, L] for each layer
+            attentions = outputs.attentions
+            
+            # 사용할 레이어 선택
+            if layer_indices is None:
+                # 마지막 레이어만 사용
+                layer_indices = [-1]
+            
+            selected_attentions = []
+            for idx in layer_indices:
+                if idx < len(attentions):
+                    selected_attentions.append(attentions[idx])
+            
+            if selected_attentions:
+                # 헤드 평균 및 레이어 평균
+                for attn in selected_attentions:
+                    # attn: [B, num_heads, L, L]
+                    # 헤드 차원에 대해 평균
+                    attn_avg = attn.mean(dim=1)  # [B, L, L]
+                    influence_matrix += attn_avg
+                
+                influence_matrix /= len(selected_attentions)
+        else:
+            # Attention weights를 얻을 수 없는 경우 fallback
+            # 단순 uniform attention 근사 (매우 기본적)
+            influence_matrix = torch.ones(B, L, L, device=device) / L
+            
+    except Exception as e:
+        # 에러 발생 시 fallback: uniform attention
+        print(f"Warning: Could not extract attention weights ({e}). Using uniform approximation.")
+        influence_matrix = torch.ones(B, L, L, device=device) / L
+    
+    # Top-k만 유지하여 sparse하게 만들기
+    if top_k < L:
+        for b in range(B):
+            for j in range(L):
+                # j번째 토큰이 참조한 토큰들 중 top-k만 유지
+                values, indices = torch.topk(influence_matrix[b, j, :], k=min(top_k, L))
+                mask = torch.zeros(L, device=device, dtype=torch.bool)
+                mask[indices] = True
+                influence_matrix[b, j, ~mask] = 0.0
+    
+    return influence_matrix
+
+
+def propagate_responsibility(
+    responsibility,
+    attention_influence,
+    uncertainty,
+    mask_index,
+    gamma_decay=0.95,
+    distance_type='token'
+):
+    """
+    Attention 그래프를 통해 불확실성을 역전파하여 책임도를 업데이트합니다.
+    
+    Args:
+        responsibility: 현재 책임도 점수 [B, L]
+        attention_influence: Attention weights [B, L, L] (j -> i)
+        uncertainty: 현재 예측의 불확실성 [B, L]
+        mask_index: 현재 마스크된 위치 [B, L]
+        gamma_decay: 거리 감쇠 인자
+        distance_type: 'token' (토큰 거리) 또는 'none' (감쇠 없음)
+        
+    Returns:
+        updated_responsibility: [B, L]
+    """
+    B, L = responsibility.shape
+    device = responsibility.device
+    
+    updated_responsibility = responsibility.clone()
+    
+    # 불확실한 토큰들에 대해서만 전파
+    # 마스크되지 않은 토큰 중 불확실성이 높은 것들
+    uncertain_mask = (~mask_index) & (uncertainty > uncertainty.median())
+    
+    for b in range(B):
+        for j in range(L):
+            if not uncertain_mask[b, j]:
+                continue
+            
+            # j번째 토큰의 불확실성
+            unc_j = uncertainty[b, j]
+            
+            # j가 참조한 토큰들 (attention_influence[b, j, i] > 0인 i들)
+            attended_indices = torch.nonzero(attention_influence[b, j, :] > 0, as_tuple=True)[0]
+            
+            for i in attended_indices:
+                # Attention weight
+                attn_weight = attention_influence[b, j, i]
+                
+                # 거리 계산
+                if distance_type == 'token':
+                    distance = abs(j - i)
+                    decay = gamma_decay ** distance
+                else:
+                    decay = 1.0
+                
+                # 책임도 전파: i가 j의 불확실성에 기여한 정도
+                contribution = attn_weight * unc_j * decay
+                updated_responsibility[b, i] += contribution
+    
+    return updated_responsibility
+
+
+@torch.no_grad()
+def decoding_graph_remask(
+    model, 
+    prompt, 
+    gen_length=256, 
+    block_length=256, 
+    temperature=0., 
+    mask_id=126336,
+    threshold_forward=0.6,      # Accept 임계값
+    threshold_back=0.9,         # Remask 임계값 (confidence)
+    resp_threshold=0.3,         # Remask 임계값 (responsibility)
+    gamma_decay=0.95,           # 거리 감쇠 인자
+    use_attention_layers=[-1],  # 사용할 attention 레이어
+    top_k_attention=10,         # Top-k attention weights
+    max_remask_ratio=0.3        # 최대 remask 비율
+):
+    """
+    Graph-aware historical remasking decoder.
+    
+    핵심 아이디어:
+    - Attention 기반으로 토큰 간 영향력(influence) 추적
+    - 불확실한 토큰이 참조한 과거 토큰들에게 책임도(responsibility) 전파
+    - Local confidence와 historical responsibility를 모두 고려하여 remask
+    
+    Args:
+        model: LLaDA 모델
+        prompt: 프롬프트 토큰 [B, L_prompt]
+        gen_length: 생성할 길이
+        block_length: 블록 길이
+        temperature: 샘플링 온도
+        mask_id: 마스크 토큰 ID
+        threshold_forward: 토큰 accept 임계값
+        threshold_back: Confidence 기반 remask 임계값
+        resp_threshold: Responsibility 기반 remask 임계값
+        gamma_decay: 거리 감쇠 인자
+        use_attention_layers: 사용할 레이어 인덱스
+        top_k_attention: 유지할 top-k attention
+        max_remask_ratio: 최대 remask 비율
+        
+    Returns:
+        x: 생성된 시퀀스 [B, L_prompt + gen_length]
+        stats: 통계 정보 딕셔너리
+    """
+    device = model.device
+    B = prompt.shape[0]
+    L_prompt = prompt.shape[1]
+    
+    # 초기화
+    x_block = torch.full((B, L_prompt + gen_length + block_length), mask_id, dtype=torch.long, device=device)
+    x_block[:, :L_prompt] = prompt.clone()
+    
+    prompt_index = (x_block != mask_id)
+    
+    # Responsibility 텐서 초기화
+    responsibility = torch.zeros_like(x_block, dtype=torch.float32, device=device)
+    
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    
+    total_steps = 0
+    total_remasks = 0
+    
+    # 통계 수집
+    stats = {
+        'steps_per_block': [],
+        'remask_counts': [],
+        'avg_responsibility': []
+    }
+    
+    for num_block in range(num_blocks):
+        block_start = L_prompt + num_block * block_length
+        block_end = L_prompt + (num_block + 1) * block_length
+        
+        block_step = 0
+        mask_index_block = (x_block == mask_id)
+        mask_index_block[:, block_end:] = False
+        
+        # 이미 unmask된 토큰 추적
+        unmask_index_block = torch.full_like(mask_index_block, False)
+        unmask_index_block[:, -block_length:] = ~mask_index_block[:, block_start:block_end]
+        
+        # Position IDs 설정 (WINO와 동일)
+        position_ids = torch.cat([
+            torch.arange(L_prompt + gen_length, device=device), 
+            torch.arange(block_start, block_end, device=device)
+        ])
+        
+        # Attention mask 설정 (WINO와 동일)
+        attention_mask = torch.ones(B, 1, x_block.shape[1], x_block.shape[1], dtype=torch.bool, device=device)
+        attention_mask[:, :, :, -block_length:] = False
+        attention_mask[:, :, -block_length:, -block_length:] = torch.ones(block_length, block_length, dtype=torch.bool, device=device)
+        attention_mask[:, :, -block_length:, block_start:block_end] = ~torch.eye(block_length, dtype=torch.bool, device=device)
+        
+        last_accept = 30
+        
+        while mask_index_block.any():
+            max_accept = min(max(int(mask_index_block.sum() * 0.7), 5), 20)
+            
+            # Forward pass with attention extraction
+            logits = model(x_block, attention_mask=attention_mask, position_ids=position_ids).logits
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+            
+            # 이미 unmask된 토큰은 유지
+            unmask_index_block_shift_left = torch.zeros_like(unmask_index_block)
+            unmask_index_block_shift_left[:, block_start:block_end] = unmask_index_block[:, -block_length:]
+            x0[unmask_index_block] = x_block[unmask_index_block_shift_left]
+            
+            # Confidence 계산
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+            
+            x0 = torch.where(mask_index_block, x0, x_block)
+            confidence = torch.where(mask_index_block, x0_p, -np.inf)
+            confidence_back = torch.where(unmask_index_block, x0_p, np.inf)
+            
+            # === Graph-Aware Component: Attention 추출 및 Responsibility 전파 ===
+            try:
+                # Attention influence 추출
+                attention_influence = extract_attention_influence(
+                    model, x_block, attention_mask=attention_mask, 
+                    layer_indices=use_attention_layers, top_k=top_k_attention
+                )
+                
+                # Uncertainty 계산
+                uncertainty = calculate_uncertainty(logits, x0, method='neg_log_prob')
+                
+                # Responsibility 전파
+                responsibility = propagate_responsibility(
+                    responsibility, attention_influence, uncertainty,
+                    mask_index_block, gamma_decay=gamma_decay
+                )
+            except Exception as e:
+                # Attention 추출 실패 시 기본 동작
+                print(f"Warning: Attention extraction failed ({e}), using confidence-only mode")
+            
+            # === Transfer (Accept) ===
+            transfer_index = confidence > threshold_forward
+            if transfer_index.sum() > max_accept:
+                # Top max_accept개만 선택
+                _, indices = torch.topk(confidence, k=max_accept, largest=True)
+                transfer_index = torch.zeros_like(confidence, dtype=torch.bool)
+                transfer_index.view(-1)[indices] = True
+            else:
+                # 최소 1개는 transfer
+                if not transfer_index.any():
+                    max_confidence_index = torch.argmax(confidence)
+                    transfer_index.view(-1)[max_confidence_index] = True
+            
+            x_block[transfer_index] = x0[transfer_index]
+            num_accept = transfer_index.sum()
+            
+            # === Remask (Backward Correction) ===
+            remask_index = torch.zeros_like(transfer_index)
+            
+            if num_accept > 1:
+                # Condition 1: Low confidence (기존 방식)
+                low_conf_mask = confidence_back < threshold_back
+                
+                # Condition 2: High responsibility (새로운 방식)
+                # Unmask된 토큰 중에서만 고려
+                resp_scores = torch.where(unmask_index_block, responsibility, -np.inf)
+                high_resp_mask = resp_scores > resp_threshold
+                
+                # 두 조건 결합
+                remask_candidates = low_conf_mask | high_resp_mask
+                
+                # Budget 제한
+                max_remask = min(int(unmask_index_block.sum() * max_remask_ratio), last_accept - 1)
+                
+                if remask_candidates.sum() >= max_remask:
+                    # Priority: responsibility * (1 if low_conf else 0.5)
+                    priority = responsibility.clone()
+                    priority[low_conf_mask] *= 2.0  # Low confidence에 더 높은 우선순위
+                    priority[~unmask_index_block] = -np.inf
+                    
+                    _, indices = torch.topk(priority.view(-1), k=max_remask, largest=True)
+                    temp_mask = torch.zeros_like(priority.view(-1), dtype=torch.bool)
+                    temp_mask[indices] = True
+                    remask_index = temp_mask.view(remask_candidates.shape)
+                else:
+                    remask_index = remask_candidates
+            
+            # Remask 적용
+            remask_index_shift = torch.zeros_like(remask_index)
+            remask_index_shift[:, block_start:block_end] = remask_index[:, -block_length:]
+            x_block[remask_index_shift] = mask_id
+            
+            # Remask된 토큰의 responsibility 리셋
+            responsibility[remask_index_shift] = 0.0
+            
+            # 인덱스 업데이트
+            mask_index_block[transfer_index] = False
+            mask_index_block[remask_index_shift] = True
+            
+            transfer_index_shift = torch.zeros_like(transfer_index)
+            transfer_index_shift[:, -block_length:] = transfer_index[:, block_start:block_end]
+            unmask_index_block[transfer_index_shift] = True
+            unmask_index_block[remask_index] = False
+            
+            last_accept = num_accept
+            block_step += 1
+            total_steps += 1
+            total_remasks += remask_index.sum().item()
+        
+        stats['steps_per_block'].append(block_step)
+        stats['remask_counts'].append(total_remasks)
+        stats['avg_responsibility'].append(responsibility.mean().item())
+    
+    stats['total_steps'] = total_steps
+    stats['total_remasks'] = total_remasks
+    
+    return x_block[:, :L_prompt + gen_length], stats
