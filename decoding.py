@@ -1040,6 +1040,9 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
     """
     모델 forward pass에서 attention 기반 영향력을 추출합니다.
     
+    LLaDA는 output_attentions를 지원하지 않으므로, 
+    Q, K를 직접 계산하여 attention weights를 구합니다.
+    
     Args:
         model: LLaDA 모델
         x: 입력 토큰 시퀀스 [B, L]
@@ -1058,35 +1061,90 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
     influence_matrix = torch.zeros(B, L, L, device=device, dtype=torch.float32)
     
     try:
-        # 모델이 attention weights를 반환하도록 시도
-        outputs = model(x, attention_mask=attention_mask, output_attentions=True)
+        # 레이어 선택
+        if layer_indices is None:
+            layer_indices = [-1]  # 마지막 레이어만
         
-        if hasattr(outputs, 'attentions') and outputs.attentions is not None:
-            # attentions: tuple of [B, num_heads, L, L] for each layer
-            attentions = outputs.attentions
-            
-            # 사용할 레이어 선택
-            if layer_indices is None:
-                # 마지막 레이어만 사용
-                layer_indices = [-1]
-            
-            selected_attentions = []
-            for idx in layer_indices:
-                if idx < len(attentions):
-                    selected_attentions.append(attentions[idx])
-            
-            if selected_attentions:
-                # 헤드 평균 및 레이어 평균
-                for attn in selected_attentions:
-                    # attn: [B, num_heads, L, L]
-                    # 헤드 차원에 대해 평균
-                    attn_avg = attn.mean(dim=1)  # [B, L, L]
-                    influence_matrix += attn_avg
-                
-                influence_matrix /= len(selected_attentions)
+        # 모델의 레이어에 접근
+        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+            layers = model.model.layers
+        elif hasattr(model, 'layers'):
+            layers = model.layers
         else:
-            # Attention weights를 얻을 수 없는 경우 fallback
-            # 단순 uniform attention 근사 (매우 기본적)
+            raise AttributeError("Cannot find model layers")
+        
+        # Embedding 계산
+        if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
+            hidden_states = model.model.embed_tokens(x)
+        elif hasattr(model, 'embed_tokens'):
+            hidden_states = model.embed_tokens(x)
+        else:
+            raise AttributeError("Cannot find embedding layer")
+        
+        # 선택된 레이어들에 대해 attention 계산
+        attention_weights_list = []
+        
+        for layer_idx in layer_indices:
+            if layer_idx < 0:
+                layer_idx = len(layers) + layer_idx
+            
+            if layer_idx >= len(layers):
+                continue
+                
+            layer = layers[layer_idx]
+            
+            # Layer의 attention 부분만 실행
+            # LLaDASequentialBlock 구조 가정
+            if hasattr(layer, 'attn_norm'):
+                x_normed = layer.attn_norm(hidden_states)
+            else:
+                x_normed = hidden_states
+            
+            # Q, K, V 계산
+            if hasattr(layer, 'att_proj'):
+                qkv = layer.att_proj(x_normed)
+                # Split into Q, K, V
+                q, k, v = qkv.split(layer.fused_dims, dim=-1)
+            else:
+                raise AttributeError("Cannot find attention projection")
+            
+            # Reshape for multi-head attention
+            # q: [B, L, d_model] -> [B, num_heads, L, head_dim]
+            num_heads = layer.config.n_heads
+            head_dim = layer.config.d_model // num_heads
+            
+            q = q.view(B, L, num_heads, head_dim).transpose(1, 2)
+            k = k.view(B, L, layer.config.effective_n_kv_heads, head_dim).transpose(1, 2)
+            
+            # GQA 처리
+            if num_heads != layer.config.effective_n_kv_heads:
+                k = k.repeat_interleave(num_heads // layer.config.effective_n_kv_heads, dim=1)
+            
+            # Attention weights 계산: softmax(Q @ K^T / sqrt(d_k))
+            # q: [B, num_heads, L, head_dim]
+            # k: [B, num_heads, L, head_dim]
+            scale = head_dim ** -0.5
+            attn_weights = torch.matmul(q, k.transpose(-2, -1)) * scale  # [B, num_heads, L, L]
+            
+            # Attention mask 적용 (있는 경우)
+            if attention_mask is not None:
+                # attention_mask: [B, 1, L, L] 형태 가정
+                attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+            
+            # Softmax
+            attn_weights = F.softmax(attn_weights, dim=-1)  # [B, num_heads, L, L]
+            
+            # 헤드 평균
+            attn_weights = attn_weights.mean(dim=1)  # [B, L, L]
+            
+            attention_weights_list.append(attn_weights)
+        
+        # 레이어 평균
+        if attention_weights_list:
+            influence_matrix = torch.stack(attention_weights_list).mean(dim=0)
+        else:
+            # Fallback: uniform attention
+            print("Warning: No attention weights extracted. Using uniform approximation.")
             influence_matrix = torch.ones(B, L, L, device=device) / L
             
     except Exception as e:
