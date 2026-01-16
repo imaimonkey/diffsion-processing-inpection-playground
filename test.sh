@@ -1,6 +1,6 @@
 #!/bin/bash
-#SBATCH --job-name=dif-prcs-ins
-#SBATCH --nodelist=server2
+#SBATCH --job-name=dif
+#SBATCH --nodelist=ubuntu
 #SBATCH --output=slurm_logs/exp2%j.out
 #SBATCH --error=slurm_logs/exp2%j.err
 #SBATCH --gres=gpu:1
