@@ -1065,24 +1065,39 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
         if layer_indices is None:
             layer_indices = [-1]  # 마지막 레이어만
         
-        # 모델의 레이어에 접근 - LLaDA 구조: model.model.transformer.blocks
+        # 모델의 레이어에 접근
+        # LLaDA 구조: model.model.transformer.blocks or model.model.transformer.block_groups
+        # 또는 model.transformer.blocks or model.transformer.block_groups (direct LLaDAModel)
+        layers = []
+        transformer = None
+        
+        # Try to access transformer - handle both LLaDAModelLM wrapper and direct LLaDAModel
         if hasattr(model, 'model') and hasattr(model.model, 'transformer'):
+            # LLaDAModelLM wrapper case
             transformer = model.model.transformer
-            # blocks 또는 block_groups 확인
-            if hasattr(transformer, 'blocks'):
-                layers = transformer.blocks
-            elif hasattr(transformer, 'block_groups'):
-                # block_groups의 경우 각 그룹의 blocks를 flatten
-                layers = []
-                for group in transformer.block_groups:
-                    if hasattr(group, 'blocks'):
-                        layers.extend(group.blocks)
-                    else:
-                        layers.append(group)
-            else:
-                raise AttributeError("Cannot find blocks or block_groups in transformer")
+        elif hasattr(model, 'transformer'):
+            # Direct LLaDAModel case
+            transformer = model.transformer
         else:
-            raise AttributeError("Cannot find model.transformer structure")
+            raise AttributeError("Cannot find transformer in model structure")
+        
+        # Extract layers from transformer
+        if hasattr(transformer, 'blocks'):
+            # Simple blocks list
+            layers = list(transformer.blocks)
+        elif hasattr(transformer, 'block_groups'):
+            # Block groups - need to extract blocks from each group
+            for group in transformer.block_groups:
+                if hasattr(group, 'blocks'):
+                    layers.extend(list(group.blocks))
+                else:
+                    # group itself might be a block
+                    layers.append(group)
+        else:
+            raise AttributeError("Cannot find blocks or block_groups in transformer")
+        
+        if len(layers) == 0:
+            raise AttributeError("No layers found in transformer")
         
         # Embedding 계산
         if hasattr(transformer, 'wte'):
