@@ -840,3 +840,161 @@ def generate_with_temporal_decay(
                     fix_time[remask_mask] = -1
 
     return x, {'x0_history': x0_history, 'token_logs': token_logs, 'total_steps': total_steps}
+
+
+@torch.no_grad()
+def baseline_sampling(
+    model,
+    tokenizer,
+    prompt_text,
+    steps=64,
+    gen_length=64,
+    block_length=64,
+    temperature=0.0,
+):
+    """
+    Baseline: Standard Iterative Decoding (No Remasking)
+    """
+    # Init
+    mask_id = 126336
+    if prompt_text:
+        prompt_tokens = tokenizer.encode(prompt_text, return_tensors="pt").to(
+            model.device
+        )
+    else:
+        prompt_tokens = torch.tensor([[]], dtype=torch.long, device=model.device)
+
+    B, L_prompt = prompt_tokens.shape
+    x = torch.full(
+        (B, L_prompt + gen_length), mask_id, dtype=torch.long, device=model.device
+    )
+    x[:, :L_prompt] = prompt_tokens
+
+    num_blocks = gen_length // block_length
+    steps = steps // num_blocks
+
+    history = []
+    start_time = time.time()
+    nfe = 0  # Number of Function Evaluations (Forward passes)
+
+    for num_block in range(num_blocks):
+        block_start = L_prompt + num_block * block_length
+        block_end = L_prompt + (num_block + 1) * block_length
+
+        block_mask_index = x[:, block_start:block_end] == mask_id
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+
+        for i in range(steps):
+            logits = model(x).logits
+            nfe += 1
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=x0.unsqueeze(-1)), -1)
+
+            mask_index = x == mask_id
+            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+            if i < num_transfer_tokens.shape[1]:
+                k = num_transfer_tokens[0, i].item()
+            else:
+                k = 0
+
+            # Standard Transfer: Top-k confidence tokens are unmasked
+            top_values, top_indices = torch.topk(confidence[0], k=k)
+            transfer_mask = torch.zeros_like(x, dtype=torch.bool)
+            transfer_mask[0, top_indices] = True
+            x[transfer_mask] = x0[transfer_mask]
+
+            # Logging
+            history.append(
+                {
+                    "step": i,
+                    "block": num_block,
+                    "nfe": nfe,
+                    "avg_confidence": x0_p.mean().item(),
+                    "text": tokenizer.decode(x[0], skip_special_tokens=True),
+                }
+            )
+
+    total_time = time.time() - start_time
+    return x, history, {"time": total_time, "nfe": nfe}
+
+@torch.no_grad()
+def inspect_sampling(
+    model,
+    tokenizer,
+    prompt_text,
+    steps=64,
+    gen_length=64,
+    block_length=64,
+    temperature=0.0,
+):
+    """
+    Inspection: Detailed logging of the sampling process.
+    Returns detailed history including token ids, predicted ids, and confidence at each step.
+    """
+    mask_id = 126336
+    if prompt_text:
+        prompt_tokens = tokenizer.encode(prompt_text, return_tensors="pt").to(
+            model.device
+        )
+    else:
+        prompt_tokens = torch.tensor([[]], dtype=torch.long, device=model.device)
+
+    B, L_prompt = prompt_tokens.shape
+    x = torch.full(
+        (B, L_prompt + gen_length), mask_id, dtype=torch.long, device=model.device
+    )
+    x[:, :L_prompt] = prompt_tokens
+
+    num_blocks = max(1, gen_length // block_length)
+    steps = steps // num_blocks
+
+    detailed_history = []
+    nfe = 0
+
+    for num_block in range(num_blocks):
+        block_start = L_prompt + num_block * block_length
+        block_end = L_prompt + (num_block + 1) * block_length
+
+        block_mask_index = x[:, block_start:block_end] == mask_id
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+
+        for i in range(steps):
+            logits = model(x).logits
+            nfe += 1
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=x0.unsqueeze(-1)), -1)
+
+            mask_index = x == mask_id
+            confidence = torch.where(mask_index, x0_p, -np.inf)
+
+            # Capture State BEFORE update
+            step_info = {
+                "step": i + num_block * steps,
+                "nfe": nfe,
+                "x_curr": x.clone().cpu(),
+                "x0_pred": x0.clone().cpu(),
+                "confidence": x0_p.clone().cpu(),
+                "mask_mask": mask_index.clone().cpu(),
+            }
+            detailed_history.append(step_info)
+
+            if i < num_transfer_tokens.shape[1]:
+                k = num_transfer_tokens[0, i].item()
+            else:
+                k = 0
+
+            top_values, top_indices = torch.topk(confidence[0], k=k)
+            transfer_mask = torch.zeros_like(x, dtype=torch.bool)
+            transfer_mask[0, top_indices] = True
+            x[transfer_mask] = x0[transfer_mask]
+
+    return x, detailed_history
