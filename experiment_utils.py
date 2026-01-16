@@ -193,6 +193,8 @@ def run_academic_benchmark(model, tokenizer,
                 prompt_tokens = torch.tensor([[]], dtype=torch.long, device=model.device)
                 
             # Run experimental sampling with current alpha_decay
+            # For TTA: alpha_decay value is used as tta_k
+            # For temporal_decay: alpha_decay is used as alpha_decay
             res_exp, logs_exp = experimental_fn(
                 model=model,
                 prompt=prompt_tokens,
@@ -201,7 +203,8 @@ def run_academic_benchmark(model, tokenizer,
                 block_length=block_length,
                 temperature=0.0,
                 remask_budget=remask_budget,
-                alpha_decay=alpha_decay  # NOW ACTUALLY USING THE THRESHOLD!
+                alpha_decay=alpha_decay,  # For temporal_decay
+                tta_k=int(alpha_decay)  # For TTA (convert to int)
             )
             
             text_exp = tokenizer.decode(res_exp[0], skip_special_tokens=True)
