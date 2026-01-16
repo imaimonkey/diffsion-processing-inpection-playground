@@ -126,10 +126,30 @@ class DiffusionMetrics:
 
 # --- Benchmark Loop ---
 
-def run_academic_benchmark(model, tokenizer, thresholds=[0.3, 0.4, 0.5, 0.6], samples=50, 
+def run_academic_benchmark(model, tokenizer, 
+                           baseline_fn=None,
+                           experimental_fn=None,
+                           thresholds=[0.05, 0.07, 0.10], 
+                           samples=50, 
                            steps=64, gen_length=64, block_length=64, 
-                           alpha_margin=0.1, remask_budget=0.05, alpha_decay=0.05):
+                           remask_budget=0.05):
+    """
+    Flexible benchmark function that compares baseline vs experimental sampling.
+    
+    Args:
+        baseline_fn: Function(model, tokenizer, prompt, steps, gen_length, block_length) -> (result, history)
+                    If None, uses inspect_sampling
+        experimental_fn: Function(model, prompt_tokens, steps, gen_length, block_length, alpha_decay, remask_budget) -> (result, logs)
+                        If None, uses generate_with_temporal_decay
+        thresholds: List of alpha_decay values to test
+    """
     print(f"Loading Academic Benchmarks (N={samples} per task)...")
+    
+    # Default functions
+    if baseline_fn is None:
+        baseline_fn = inspect_sampling
+    if experimental_fn is None:
+        experimental_fn = generate_with_temporal_decay
     
     # Load via benchmark_utils
     gsm8k_data = benchmark_utils.load_gsm8k(n_samples=samples)
@@ -148,9 +168,8 @@ def run_academic_benchmark(model, tokenizer, thresholds=[0.3, 0.4, 0.5, 0.6], sa
         prompt = item['question']
         ground_truth = item['ground_truth']
         
-        # 1. Baseline (Standard Sampling)
-        # Using inspect_sampling from decoding module (needs to be available)
-        res_base, hist_base = inspect_sampling(
+        # 1. Baseline
+        res_base, hist_base = baseline_fn(
             model, tokenizer, prompt, steps=steps, 
             gen_length=gen_length, block_length=block_length
         )
@@ -161,19 +180,20 @@ def run_academic_benchmark(model, tokenizer, thresholds=[0.3, 0.4, 0.5, 0.6], sa
         correct_base = benchmark_utils.check_correctness(text_base, ground_truth, category)
         stab_base = DiffusionMetrics.compute_stability([h['x0_pred'][0] for h in hist_base])
         
-        for th in thresholds:
+        # 2. Experimental - Test each threshold (alpha_decay value)
+        for alpha_decay in thresholds:
             current_run += 1
             if current_run % 10 == 0:
-                print(f"Progress: [{current_run}/{total_runs}]")
+                print(f"Progress: [{current_run}/{total_runs}] - Testing alpha_decay={alpha_decay}")
                 
-            # 2. Experimental (Proposed Method)
-            # Calling generate_with_temporal_decay from decoding module
+            # Prepare prompt tokens
             if prompt:
                 prompt_tokens = tokenizer.encode(prompt, return_tensors='pt').to(model.device)
             else:
                 prompt_tokens = torch.tensor([[]], dtype=torch.long, device=model.device)
                 
-            res_exp, logs_exp = generate_with_temporal_decay(
+            # Run experimental sampling with current alpha_decay
+            res_exp, logs_exp = experimental_fn(
                 model=model,
                 prompt=prompt_tokens,
                 steps=steps,
@@ -181,25 +201,8 @@ def run_academic_benchmark(model, tokenizer, thresholds=[0.3, 0.4, 0.5, 0.6], sa
                 block_length=block_length,
                 temperature=0.0,
                 remask_budget=remask_budget,
-                alpha_decay=alpha_decay
-                # Note: remask_threshold is NOT used in the current generate_with_temporal_decay signature 
-                # based on previous task summary (it uses alpha_decay/stability score).
-                # However, the user request mentioned varying remask_threshold.
-                # If the function doesn't support it, we might be varying a parameter that does nothing?
-                # Let's assume for now we pass it if supported or verify decoding.py later.
-                # Actually, looking at Step 98 summary, remask_threshold was removed in favor of alpha_decay.
-                # But the benchmark loops over 'thresholds'. 
-                # Perhaps 'thresholds' here refers to 'remask_budget' or 'alpha_decay'?
-                # The user's notebook code looped 'remask_threshold'.
-                # I will map 'th' to 'alpha_decay' or 'remask_budget' if that was the intent.
-                # Wait, earlier summary said "remask_threshold parameter is no longer directly used...".
-                # User might want to vary alpha_decay instead.
-                # I will pass 'alpha_decay=th' here to make the loop meaningful if th is in [0.0 - 1.0 range similar to decay].
-                # Or if threshold meant confidence threshold.
-                # I will stick to passing it as alpha_decay for now as that seems to be the new knob.
+                alpha_decay=alpha_decay  # NOW ACTUALLY USING THE THRESHOLD!
             )
-            # Wait, if I pass th as alpha_decay, I should be careful. 
-            # Let's assume for this refactor I pass it as alpha_decay since remask_threshold is deprecated.
             
             text_exp = tokenizer.decode(res_exp[0], skip_special_tokens=True)
             
@@ -219,7 +222,7 @@ def run_academic_benchmark(model, tokenizer, thresholds=[0.3, 0.4, 0.5, 0.6], sa
                 "Category": category,
                 "Prompt": prompt,
                 "GroundTruth": ground_truth,
-                "Threshold": th, # This represents the varied parameter (likely alpha_decay now)
+                "AlphaDecay": alpha_decay,  # Clearer naming
                 # Accuracy (Boolean 1/0 for averaging)
                 "Acc_Base": 1.0 if correct_base else 0.0,
                 "Acc_Exp": 1.0 if correct_exp else 0.0,
@@ -241,10 +244,10 @@ def run_academic_benchmark(model, tokenizer, thresholds=[0.3, 0.4, 0.5, 0.6], sa
 def analyze_icml_results(df):
     print("\\n===== ICML Benchmark Results =====")
     
-    # 1. Main Table: Accuracy & PPL per Threshold
+    # 1. Main Table: Accuracy & PPL per AlphaDecay
     # Ensure numeric columns
     numeric_cols = ["Acc_Base", "Acc_Exp", "Acc_Delta", "PPL_Delta", "Stability_Delta"]
-    summary = df.groupby(["Category", "Threshold"])[numeric_cols].mean()
+    summary = df.groupby(["Category", "AlphaDecay"])[numeric_cols].mean()
     display(summary)
     
     # 2. Visualization
@@ -252,14 +255,14 @@ def analyze_icml_results(df):
     
     # Accuracy Plot
     plt.subplot(1, 2, 1)
-    sns.barplot(data=df, x="Threshold", y="Acc_Exp", hue="Category")
+    sns.barplot(data=df, x="AlphaDecay", y="Acc_Exp", hue="Category")
     plt.axhline(df["Acc_Base"].mean(), color='red', linestyle='--', label="Baseline Avg")
-    plt.title("Accuracy vs Threshold (Higher is Better)")
+    plt.title("Accuracy vs Alpha Decay (Higher is Better)")
     plt.legend()
     
     # PPL Delta Plot
     plt.subplot(1, 2, 2)
-    sns.lineplot(data=df, x="Threshold", y="PPL_Delta", hue="Category", marker="o")
+    sns.lineplot(data=df, x="AlphaDecay", y="PPL_Delta", hue="Category", marker="o")
     plt.axhline(0, color='black', linestyle='--')
     plt.title("Perplexity Delta (Lower is Better)")
     
@@ -268,14 +271,14 @@ def analyze_icml_results(df):
     
     # 3. Statistical Highlight
     print("\\n[Key Findings]")
-    # Mean across all categories for each threshold
-    global_stats = df.groupby("Threshold")["Acc_Exp"].mean()
+    # Mean across all categories for each alpha_decay
+    global_stats = df.groupby("AlphaDecay")["Acc_Exp"].mean()
     if not global_stats.empty:
-        best_th = global_stats.idxmax()
+        best_alpha = global_stats.idxmax()
         best_acc = global_stats.max()
         base_acc = df["Acc_Base"].mean()
         
-        print(f"Best Threshold (Alpha Decay): {best_th}")
+        print(f"Best Alpha Decay: {best_alpha}")
         print(f"Optimal Accuracy: {best_acc:.2%}")
         print(f"Baseline Accuracy: {base_acc:.2%}")
         print(f"Improvement: {best_acc - base_acc:+.2%}")
