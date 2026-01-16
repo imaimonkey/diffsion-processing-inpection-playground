@@ -1125,12 +1125,20 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
                 x_normed = hidden_states
             
             # Q, K, V 계산
+            # LLaDASequentialBlock: fused att_proj that outputs [Q, K, V]
+            # LLaDALlamaBlock: separate q_proj, k_proj, v_proj
             if hasattr(layer, 'att_proj'):
+                # LLaDASequentialBlock case
                 qkv = layer.att_proj(x_normed)
                 # Split into Q, K, V
                 q, k, v = qkv.split(layer.fused_dims, dim=-1)
+            elif hasattr(layer, 'q_proj') and hasattr(layer, 'k_proj') and hasattr(layer, 'v_proj'):
+                # LLaDALlamaBlock case
+                q = layer.q_proj(x_normed)
+                k = layer.k_proj(x_normed)
+                v = layer.v_proj(x_normed)
             else:
-                raise AttributeError("Cannot find attention projection (att_proj)")
+                raise AttributeError("Cannot find attention projection (neither att_proj nor q_proj/k_proj/v_proj)")
             
             # Reshape for multi-head attention
             # q: [B, L, d_model] -> [B, num_heads, L, head_dim]
