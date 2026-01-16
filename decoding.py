@@ -1065,21 +1065,30 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
         if layer_indices is None:
             layer_indices = [-1]  # 마지막 레이어만
         
-        # 모델의 레이어에 접근
-        if hasattr(model, 'model') and hasattr(model.model, 'layers'):
-            layers = model.model.layers
-        elif hasattr(model, 'layers'):
-            layers = model.layers
+        # 모델의 레이어에 접근 - LLaDA 구조: model.model.transformer.blocks
+        if hasattr(model, 'model') and hasattr(model.model, 'transformer'):
+            transformer = model.model.transformer
+            # blocks 또는 block_groups 확인
+            if hasattr(transformer, 'blocks'):
+                layers = transformer.blocks
+            elif hasattr(transformer, 'block_groups'):
+                # block_groups의 경우 각 그룹의 blocks를 flatten
+                layers = []
+                for group in transformer.block_groups:
+                    if hasattr(group, 'blocks'):
+                        layers.extend(group.blocks)
+                    else:
+                        layers.append(group)
+            else:
+                raise AttributeError("Cannot find blocks or block_groups in transformer")
         else:
-            raise AttributeError("Cannot find model layers")
+            raise AttributeError("Cannot find model.transformer structure")
         
         # Embedding 계산
-        if hasattr(model, 'model') and hasattr(model.model, 'embed_tokens'):
-            hidden_states = model.model.embed_tokens(x)
-        elif hasattr(model, 'embed_tokens'):
-            hidden_states = model.embed_tokens(x)
+        if hasattr(transformer, 'wte'):
+            hidden_states = transformer.wte(x)
         else:
-            raise AttributeError("Cannot find embedding layer")
+            raise AttributeError("Cannot find embedding layer (wte)")
         
         # 선택된 레이어들에 대해 attention 계산
         attention_weights_list = []
@@ -1088,7 +1097,7 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
             if layer_idx < 0:
                 layer_idx = len(layers) + layer_idx
             
-            if layer_idx >= len(layers):
+            if layer_idx >= len(layers) or layer_idx < 0:
                 continue
                 
             layer = layers[layer_idx]
@@ -1106,7 +1115,7 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
                 # Split into Q, K, V
                 q, k, v = qkv.split(layer.fused_dims, dim=-1)
             else:
-                raise AttributeError("Cannot find attention projection")
+                raise AttributeError("Cannot find attention projection (att_proj)")
             
             # Reshape for multi-head attention
             # q: [B, L, d_model] -> [B, num_heads, L, head_dim]
@@ -1129,7 +1138,15 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
             # Attention mask 적용 (있는 경우)
             if attention_mask is not None:
                 # attention_mask: [B, 1, L, L] 형태 가정
-                attn_weights = attn_weights + attention_mask.to(attn_weights.dtype)
+                # Mask 값이 True인 곳은 attend 가능, False는 -inf로 마스킹
+                mask_value = torch.finfo(attn_weights.dtype).min
+                # attention_mask가 boolean이면 inverse해서 사용
+                if attention_mask.dtype == torch.bool:
+                    # True = attend 가능, False = mask
+                    attn_mask_expanded = ~attention_mask
+                else:
+                    attn_mask_expanded = attention_mask == 0
+                attn_weights = attn_weights.masked_fill(attn_mask_expanded, mask_value)
             
             # Softmax
             attn_weights = F.softmax(attn_weights, dim=-1)  # [B, num_heads, L, L]
@@ -1150,6 +1167,8 @@ def extract_attention_influence(model, x, attention_mask=None, layer_indices=Non
     except Exception as e:
         # 에러 발생 시 fallback: uniform attention
         print(f"Warning: Could not extract attention weights ({e}). Using uniform approximation.")
+        import traceback
+        traceback.print_exc()
         influence_matrix = torch.ones(B, L, L, device=device) / L
     
     # Top-k만 유지하여 sparse하게 만들기
