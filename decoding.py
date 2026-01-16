@@ -690,3 +690,123 @@ def get_transfer_index_dynamic(logits, temperature, remasking, mask_index, x, nu
         transfer_index[j, select_index] = True
 
     return x0, transfer_index
+
+@torch.no_grad()
+def generate_with_temporal_decay(
+    model, 
+    prompt, 
+    steps=64, 
+    gen_length=64, 
+    block_length=64, 
+    temperature=0.0,
+    cfg_scale=0., 
+    remask_budget=0.0, 
+    alpha_decay=0.0, 
+    mask_id=126336, 
+    attention_mask=None
+):
+    '''
+    Generalized Sampling with Temporal Decay and Budgeted Remasking.
+    '''
+    # Initialize
+    x = torch.full((prompt.shape[0], prompt.shape[1] + gen_length), mask_id, dtype=torch.long).to(model.device)
+    x[:, :prompt.shape[1]] = prompt.clone()
+    
+    prompt_index = (x != mask_id)
+    
+    # Fix Time Tracking: Initialize with -1
+    fix_time = torch.full_like(x, -1)
+    # Mark prompt as fixed at step -999 (permanent)
+    fix_time[:, :prompt.shape[1]] = -999 
+
+    assert gen_length % block_length == 0
+    num_blocks = gen_length // block_length
+    steps = steps // num_blocks
+    
+    total_steps = steps * num_blocks
+    current_step = 0
+
+    for num_block in range(num_blocks):
+        block_start = prompt.shape[1] + num_block * block_length
+        block_end = prompt.shape[1] + (num_block + 1) * block_length
+        
+        # Calculate schedule for this block
+        block_mask_index = (x[:, block_start:block_end] == mask_id)
+        num_transfer_tokens = get_num_transfer_tokens(block_mask_index, steps)
+        
+        for i in range(steps):
+            current_step += 1
+            mask_index = (x == mask_id)
+            
+            # --- Prdict ---
+            if cfg_scale > 0.:
+                un_x = x.clone()
+                un_x[prompt_index] = mask_id
+                x_ = torch.cat([x, un_x], dim=0)
+                if attention_mask is not None:
+                    attention_mask_ = torch.cat([attention_mask, attention_mask], dim=0)
+                else:
+                    attention_mask_ = None
+                logits = model(x_, attention_mask=attention_mask_).logits
+                logits, un_logits = torch.chunk(logits, 2, dim=0)
+                logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
+            else:
+                logits = model(x, attention_mask=attention_mask).logits
+
+            logits_with_noise = add_gumbel_noise(logits, temperature=temperature)
+            x0 = torch.argmax(logits_with_noise, dim=-1)
+
+            p = F.softmax(logits.to(torch.float64), dim=-1)
+            x0_p = torch.squeeze(torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1)
+            
+            # Prevent lookahead
+            x0_p[:, block_end:] = -np.inf
+            
+            # --- Transfer (Forward) ---
+            x0 = torch.where(mask_index, x0, x)
+            confidence = torch.where(mask_index, x0_p, -np.inf)
+            
+            transfer_index = torch.zeros_like(x0, dtype=torch.bool, device=x0.device)
+            for j in range(confidence.shape[0]):
+                k = num_transfer_tokens[j, i]
+                _, select_index = torch.topk(confidence[j], k=k)
+                transfer_index[j, select_index] = True
+                
+            x[transfer_index] = x0[transfer_index]
+            fix_time[transfer_index] = current_step
+            
+            # --- Remasking (Backward Correction) ---
+            if remask_budget > 0.0:
+                # 1. Identify Candidates: Generated tokens (not prompt, not mask)
+                generated_mask = (x != mask_id) & (fix_time != -999)
+                
+                if generated_mask.any():
+                    # 2. Calculate Stability Score
+                    # Score = Confidence + Alpha * Age
+                    # Age = current_step - fix_time
+                    ages = current_step - fix_time
+                    stability_score = x0_p + alpha_decay * ages.float()
+                    
+                    # Mask out non-candidates (score -> inf)
+                    candidate_scores = torch.where(generated_mask, stability_score, torch.tensor(float('inf'), device=x.device))
+                    
+                    # 3. Budget Selection per batch
+                    remask_mask = torch.zeros_like(x, dtype=torch.bool)
+                    for b in range(x.shape[0]):
+                         # Count total generated tokens for this batch
+                        n_gen = generated_mask[b].sum().item()
+                        if n_gen > 0:
+                            budget_k = max(1, int(n_gen * remask_budget))
+                            
+                            # Select lowest scores
+                            # Limit k to actual candidates
+                            valid_k = min(budget_k, n_gen)
+                            
+                            _, bottom_indices = torch.topk(candidate_scores[b], k=valid_k, largest=False)
+                            remask_mask[b, bottom_indices] = True
+                    
+                    # Apply Remask
+                    x[remask_mask] = mask_id
+                    fix_time[remask_mask] = -1
+
+    return x, total_steps
